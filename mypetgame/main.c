@@ -1538,6 +1538,933 @@ Music carregarMusicaDoAsset(const char *arquivo)
 }
 
 
+
+// ==================================================
+// SESSÃO DE JOGO — ESTRUTURAS DE SUPORTE AO LOOP PRINCIPAL
+// ==================================================
+// Tudo que antes era variável solta dentro de main() agora vive em structs,
+// para que as telas (menu, jogo, histórico...) possam ser tratadas por
+// funções próprias em vez de um único main() gigante.
+
+// Tempo restante de bloqueio de cada botão depois de uma recusa (ver
+// COOLDOWN_RECUSA_SEGUNDOS e chanceDeRecusa).
+typedef struct
+{
+    float refeicao;
+    float petisco;
+    float brincar;
+    float remedio;
+} Cooldowns;
+
+// Relógios (em segundos de jogo) que disparam os eventos periódicos da
+// simulação ao vivo: pulso de necessidades, avanço de dia, cocô, pedidos de
+// atenção, autosave e o "incômodo" de dormir de luz acesa.
+typedef struct
+{
+    float tick;
+    float idade;
+    float coco;
+    float proximoCoco;
+    float atencao;
+    float proximaAtencao;
+    float choro;
+    float autosave;
+    float acumuladorLuz;
+} RelogiosSimulacao;
+
+// Configuração fixa do painel do modo dev (F1): os ponteiros apontam direto
+// para os campos do Pet desta sessão, montados uma única vez em main().
+typedef struct
+{
+    int *ponteiros[7];
+    const char *nomes[7];
+    int minimo[7];
+    int maximo[7];
+    int passo[7];
+    float velocidades[5];
+    int numVelocidades;
+} PainelDevConfig;
+
+// Botões de cada tela, agrupados do jeito que já estavam comentados no
+// código original — só que agora como dados em vez de variáveis soltas.
+typedef struct
+{
+    Rectangle novoJogo;
+    Rectangle carregarJogo;
+    Rectangle verHistorico;
+} BotoesMenu;
+
+typedef struct
+{
+    Rectangle novoPet;
+    Rectangle continuar;
+} BotoesPopupAdulto;
+
+typedef struct
+{
+    Rectangle anterior;
+    Rectangle proxima;
+    Rectangle voltar;
+} BotoesHistorico;
+
+typedef struct
+{
+    Rectangle caixaNome;
+    Rectangle horaMenos;
+    Rectangle horaMais;
+    Rectangle comecar;
+    Rectangle voltar;
+} BotoesNomear;
+
+typedef struct
+{
+    Rectangle refeicao;
+    Rectangle petisco;
+    Rectangle brincar;
+    Rectangle dormir;
+    Rectangle remedio;
+    Rectangle elogiar;
+    Rectangle repreender;
+    Rectangle luz;
+    Rectangle salvar;
+    Rectangle menuTopo;
+} BotoesJogo;
+
+typedef struct
+{
+    Rectangle painel;
+    Rectangle velMenos;
+    Rectangle velMais;
+    Rectangle statMenos[7];
+    Rectangle statMais[7];
+    Rectangle doente;
+    Rectangle avancarDia;
+    Rectangle horaMenos;
+    Rectangle horaMais;
+} BotoesDev;
+
+typedef struct
+{
+    Rectangle novoJogo;
+    Rectangle sair;
+} BotoesMorte;
+
+typedef struct
+{
+    BotoesMenu menu;
+    BotoesPopupAdulto popupAdulto;
+    BotoesHistorico historico;
+    BotoesNomear nomear;
+    BotoesJogo jogo;
+    BotoesDev dev;
+    BotoesMorte morte;
+} Botoes;
+
+// Texturas, sons e música — carregados uma vez no início e usados só para
+// leitura durante o jogo todo.
+typedef struct
+{
+    Texture2D texturasEstagio[ESTAGIO_TOTAL];
+    Texture2D bebeIdle1, bebeIdle2;
+    Texture2D juvenil1Idle1, juvenil1Idle2;
+    Texture2D juvenil2Idle1, juvenil2Idle2;
+
+    Sound sonsChoro[6];
+    Sound somComer;
+    Sound somBrincar;
+    Music musicaFundo;
+} Recursos;
+
+// Todo o estado "ao vivo" da sessão de jogo: o pet, o histórico, em que tela
+// o jogador está, e todos os timers/mensagens/flags de UI que antes eram
+// variáveis soltas em main().
+typedef struct
+{
+    Pet pet;
+    EstadoJogo estado;
+    bool saveExiste;
+
+    HistoricoPet historico[MAX_HISTORICO];
+    int numHistorico;
+    int paginaHistorico;
+
+    bool modoDev;
+    int velocidadeDevIndice;
+
+    char nomeDigitado[NOME_MAX];
+    int letraCount;
+    int horaEscolhida;
+
+    RelogiosSimulacao relogios;
+
+    bool luzAcesa;
+
+    float mensagemSalvoTimer;
+    float mensagemAcaoTimer;
+    char mensagemAcaoTexto[100];
+
+    Cooldowns cooldowns;
+
+    float bannerEvolucaoTimer;
+    char bannerEvolucaoTexto[100];
+
+    char popupAdultoTexto[100];
+
+    float tempoAnimacao;
+    int framePet;
+} Sessao;
+
+
+// ==================================================
+// HELPERS DO LOOP PRINCIPAL
+// ==================================================
+
+// Reinicia os relógios de simulação e a UI de uma sessão de jogo — usado
+// tanto ao carregar um save quanto ao começar um pet novo (eram dois blocos
+// idênticos duplicados dentro de main()).
+void resetarSessaoDeJogo(
+    RelogiosSimulacao *relogios,
+    bool *luzAcesa,
+    float *bannerEvolucaoTimer,
+    Cooldowns *cooldowns,
+    int disciplina
+)
+{
+    relogios->tick = 0.0f;
+    relogios->idade = 0.0f;
+    relogios->coco = 0.0f;
+    relogios->proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
+    relogios->atencao = 0.0f;
+    relogios->proximaAtencao = calcularProximaAtencao(disciplina);
+    relogios->autosave = 0.0f;
+    relogios->acumuladorLuz = 0.0f;
+
+    *luzAcesa = true;
+    *bannerEvolucaoTimer = 0.0f;
+
+    cooldowns->refeicao = 0.0f;
+    cooldowns->petisco = 0.0f;
+    cooldowns->brincar = 0.0f;
+    cooldowns->remedio = 0.0f;
+}
+
+// Desenha a coluna de botões de ação da tela de jogo — usada tanto no
+// desenho normal quanto redesenhada por cima do escurecimento de "luz
+// apagada" (eram dois blocos idênticos duplicados dentro de main()).
+void desenharBotoesDeAcao(Pet *pet, Cooldowns cooldowns, bool luzAcesa, BotoesJogo botoes)
+{
+    if (cooldowns.refeicao > 0.0f) desenharBotaoBloqueado("REFEICAO", botoes.refeicao); else desenharBotao("REFEICAO", botoes.refeicao);
+    if (cooldowns.petisco  > 0.0f) desenharBotaoBloqueado("PETISCO", botoes.petisco);   else desenharBotao("PETISCO", botoes.petisco);
+    if (cooldowns.brincar  > 0.0f) desenharBotaoBloqueado("BRINCAR", botoes.brincar);   else desenharBotao("BRINCAR", botoes.brincar);
+    desenharBotao(pet->dormindo ? "ACORDAR" : "DORMIR", botoes.dormir);
+    if (cooldowns.remedio  > 0.0f) desenharBotaoBloqueado("REMEDIO", botoes.remedio);   else desenharBotao("REMEDIO", botoes.remedio);
+    desenharBotao("ELOGIAR", botoes.elogiar);
+    desenharBotao("REPREENDER", botoes.repreender);
+    desenharBotao(luzAcesa ? "APAGAR LUZ" : "ACENDER LUZ", botoes.luz);
+    desenharBotao("SALVAR", botoes.salvar);
+    desenharBotao("MENU", botoes.menuTopo);
+}
+
+
+// ==================================================
+// TELAS — ATUALIZAR (INPUT + LÓGICA)
+// ==================================================
+
+void atualizarMenu(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+{
+    if (!clique) return;
+
+    if (CheckCollisionPointRec(mouse, botoes->menu.novoJogo))
+    {
+        s->nomeDigitado[0] = '\0';
+        s->letraCount = 0;
+        s->horaEscolhida = obterHoraLocalAtual();
+        s->estado = ESTADO_NOMEAR;
+    }
+
+    if (s->saveExiste && CheckCollisionPointRec(mouse, botoes->menu.carregarJogo))
+    {
+        if (carregarJogo(&s->pet, s->historico, &s->numHistorico))
+        {
+            resetarSessaoDeJogo(&s->relogios, &s->luzAcesa, &s->bannerEvolucaoTimer, &s->cooldowns, s->pet.disciplina);
+
+            // Simula o tempo real que passou desde o último save (o jogo
+            // "correndo" enquanto o app estava fechado).
+            bool tornouAdultoOffline = false;
+
+            if (s->pet.vivo)
+            {
+                double segundosOffline = (double)(time(NULL) - (time_t)s->pet.ultimoSalvamento);
+                simularTempoOffline(&s->pet, s->historico, &s->numHistorico, segundosOffline, &tornouAdultoOffline);
+            }
+
+            if (!s->pet.vivo)
+            {
+                s->estado = ESTADO_MORTE;
+            }
+            else if (tornouAdultoOffline)
+            {
+                snprintf(s->popupAdultoTexto, sizeof(s->popupAdultoTexto), "Parabens! %s agora e um adulto!", s->pet.nome);
+                s->estado = ESTADO_ADULTO_POPUP;
+            }
+            else
+            {
+                s->estado = ESTADO_JOGO;
+            }
+
+            salvarJogo(&s->pet, s->historico, s->numHistorico); // persiste o resultado do tempo offline
+        }
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->menu.verHistorico))
+    {
+        s->paginaHistorico = 0;
+        s->estado = ESTADO_HISTORICO;
+    }
+}
+
+void atualizarHistorico(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+{
+    if (!clique) return;
+
+    const int itensPorPagina = 6;
+    int totalPaginas = (s->numHistorico + itensPorPagina - 1) / itensPorPagina;
+    if (totalPaginas < 1) totalPaginas = 1;
+
+    if (CheckCollisionPointRec(mouse, botoes->historico.anterior) && s->paginaHistorico > 0)
+        s->paginaHistorico--;
+
+    if (CheckCollisionPointRec(mouse, botoes->historico.proxima) && s->paginaHistorico < totalPaginas - 1)
+        s->paginaHistorico++;
+
+    if (CheckCollisionPointRec(mouse, botoes->historico.voltar))
+        s->estado = ESTADO_MENU;
+}
+
+void atualizarNomear(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+{
+    int tecla = GetCharPressed();
+
+    while (tecla > 0)
+    {
+        if ((tecla >= 32) && (tecla <= 125) && (s->letraCount < NOME_MAX - 1))
+        {
+            s->nomeDigitado[s->letraCount] = (char)tecla;
+            s->letraCount++;
+            s->nomeDigitado[s->letraCount] = '\0';
+        }
+
+        tecla = GetCharPressed();
+    }
+
+    if (IsKeyPressed(KEY_BACKSPACE) && s->letraCount > 0)
+    {
+        s->letraCount--;
+        s->nomeDigitado[s->letraCount] = '\0';
+    }
+
+    if (clique)
+    {
+        if (CheckCollisionPointRec(mouse, botoes->nomear.horaMenos))
+            s->horaEscolhida = (s->horaEscolhida + 23) % 24;
+
+        if (CheckCollisionPointRec(mouse, botoes->nomear.horaMais))
+            s->horaEscolhida = (s->horaEscolhida + 1) % 24;
+    }
+
+    bool podeComecar = (s->letraCount > 0);
+
+    if ((clique && podeComecar && CheckCollisionPointRec(mouse, botoes->nomear.comecar)) ||
+        (podeComecar && IsKeyPressed(KEY_ENTER)))
+    {
+        iniciarNovoJogo(&s->pet, s->nomeDigitado, s->horaEscolhida);
+
+        resetarSessaoDeJogo(&s->relogios, &s->luzAcesa, &s->bannerEvolucaoTimer, &s->cooldowns, s->pet.disciplina);
+
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+        s->saveExiste = true;
+
+        s->estado = ESTADO_JOGO;
+    }
+
+    if (clique && CheckCollisionPointRec(mouse, botoes->nomear.voltar))
+    {
+        s->estado = ESTADO_MENU;
+    }
+}
+
+void atualizarJogo(Sessao *s, Botoes *botoes, Recursos *recursos, PainelDevConfig *devCfg, Vector2 mouse, bool clique, float dt)
+{
+    // ---------- MODO DEV ----------
+
+    if (IsKeyPressed(KEY_F1))
+        s->modoDev = !s->modoDev;
+
+    // dtSimulado é o "dt de jogo": igual ao dt real, exceto que o modo dev
+    // pode multiplicá-lo pra acelerar o tempo. epochCriacao é deslocado pelo
+    // tempo "extra" pra a hora-do-dia do pet acompanhar.
+    float dtSimulado = dt;
+
+    if (s->modoDev)
+    {
+        dtSimulado = dt * devCfg->velocidades[s->velocidadeDevIndice];
+        s->pet.epochCriacao -= (long long)(dtSimulado - dt);
+    }
+
+    // ---------- ANIMAÇÃO ----------
+
+    s->tempoAnimacao += dt;
+
+    if (s->tempoAnimacao >= 0.5f)
+    {
+        s->tempoAnimacao = 0.0f;
+        s->framePet = (s->framePet == 0) ? 1 : 0;
+    }
+
+    // ---------- NECESSIDADES + AMOSTRAGEM PARA EVOLUÇÃO ----------
+
+    s->relogios.tick += dtSimulado;
+
+    if (s->relogios.tick >= INTERVALO_TICK)
+    {
+        s->relogios.tick = 0.0f;
+        executarTick(&s->pet, s->historico, &s->numHistorico);
+    }
+
+    // ---------- ENVELHECIMENTO / NÍVEL / EVOLUÇÃO ----------
+
+    s->relogios.idade += dtSimulado;
+
+    if (s->relogios.idade >= INTERVALO_DIA && s->pet.vivo)
+    {
+        s->relogios.idade = 0.0f;
+
+        char mensagemEvolucao[100];
+        bool tornouAdulto = executarAvancoDeDia(&s->pet, s->historico, &s->numHistorico, mensagemEvolucao, sizeof(mensagemEvolucao));
+
+        if (tornouAdulto)
+        {
+            snprintf(s->popupAdultoTexto, sizeof(s->popupAdultoTexto), "Parabens! %s agora e um adulto!", s->pet.nome);
+            s->estado = ESTADO_ADULTO_POPUP;
+        }
+        else if (mensagemEvolucao[0] != '\0')
+        {
+            strncpy(s->bannerEvolucaoTexto, mensagemEvolucao, sizeof(s->bannerEvolucaoTexto) - 1);
+            s->bannerEvolucaoTexto[sizeof(s->bannerEvolucaoTexto) - 1] = '\0';
+            s->bannerEvolucaoTimer = 5.0f;
+        }
+    }
+
+    // ---------- LUZ ----------
+    // (a recuperação de energia e o acordar automático agora ficam dentro de
+    // executarTick, junto com o resto das necessidades — assim funcionam
+    // também durante o tempo offline)
+
+    if (s->pet.dormindo && s->luzAcesa)
+    {
+        s->relogios.acumuladorLuz += dtSimulado;
+
+        if (s->relogios.acumuladorLuz >= 1800.0f) // dormir de luz acesa incomoda, a cada 30 min
+        {
+            s->relogios.acumuladorLuz = 0.0f;
+            s->pet.felicidade -= 2;
+            limitarStatus(&s->pet);
+        }
+    }
+
+    // ---------- COCÔ ----------
+
+    s->relogios.coco += dtSimulado;
+
+    if (s->relogios.coco >= s->relogios.proximoCoco)
+    {
+        s->relogios.coco = 0.0f;
+        s->relogios.proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
+        adicionarCoco(&s->pet);
+    }
+
+    // ---------- CHAMADO DE ATENÇÃO ----------
+
+    s->relogios.atencao += dtSimulado;
+
+    if (s->relogios.atencao >= s->relogios.proximaAtencao && !s->pet.pedindoAtencao && !s->pet.dormindo)
+    {
+        s->relogios.atencao = 0.0f;
+        s->relogios.proximaAtencao = calcularProximaAtencao(s->pet.disciplina);
+
+        s->pet.pedindoAtencao = true;
+        s->pet.atencaoPorNecessidade = precisaCuidado(&s->pet); // fixado agora, não recalculado depois
+
+        s->relogios.choro = 0.0f;
+        PlaySound(recursos->sonsChoro[indiceSomChoro(s->pet.estagio)]);
+    }
+
+    // Enquanto estiver pedindo atenção, repete o choro a cada 3s reais (não
+    // usa dtSimulado — o modo dev não deve acelerar o som).
+    if (s->pet.pedindoAtencao)
+    {
+        s->relogios.choro += dt;
+
+        if (s->relogios.choro >= 3.0f)
+        {
+            s->relogios.choro -= 3.0f;
+            PlaySound(recursos->sonsChoro[indiceSomChoro(s->pet.estagio)]);
+        }
+    }
+    else
+    {
+        s->relogios.choro = 0.0f;
+    }
+
+    // ---------- AUTOSAVE ----------
+
+    s->relogios.autosave += dt;
+
+    if (s->relogios.autosave >= INTERVALO_AUTOSAVE)
+    {
+        s->relogios.autosave = 0.0f;
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+    }
+
+    if (s->mensagemSalvoTimer > 0.0f)
+        s->mensagemSalvoTimer -= dt;
+
+    if (s->mensagemAcaoTimer > 0.0f)
+        s->mensagemAcaoTimer -= dt;
+
+    if (s->cooldowns.refeicao > 0.0f) s->cooldowns.refeicao -= dtSimulado;
+    if (s->cooldowns.petisco  > 0.0f) s->cooldowns.petisco  -= dtSimulado;
+    if (s->cooldowns.brincar  > 0.0f) s->cooldowns.brincar  -= dtSimulado;
+    if (s->cooldowns.remedio  > 0.0f) s->cooldowns.remedio  -= dtSimulado;
+
+    if (s->bannerEvolucaoTimer > 0.0f)
+        s->bannerEvolucaoTimer -= dt;
+
+    // ---------- MORTE ----------
+    // (o arquivamento em "pets descobertos" já é feito dentro de executarTick)
+
+    if (!s->pet.vivo)
+    {
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+        s->estado = ESTADO_MORTE;
+    }
+
+    // ---------- CLIQUES ----------
+
+    if (!clique) return;
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.refeicao) && s->cooldowns.refeicao <= 0.0f)
+    {
+        if (darRefeicao(&s->pet))
+            PlaySound(recursos->somComer);
+        else
+        {
+            snprintf(s->mensagemAcaoTexto, sizeof(s->mensagemAcaoTexto), "%s recusou a refeicao!", s->pet.nome);
+            s->mensagemAcaoTimer = 2.0f;
+            s->cooldowns.refeicao = COOLDOWN_RECUSA_SEGUNDOS;
+        }
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.petisco) && s->cooldowns.petisco <= 0.0f)
+    {
+        if (darPetisco(&s->pet))
+            PlaySound(recursos->somComer);
+        else
+        {
+            snprintf(s->mensagemAcaoTexto, sizeof(s->mensagemAcaoTexto), "%s recusou o petisco!", s->pet.nome);
+            s->mensagemAcaoTimer = 2.0f;
+            s->cooldowns.petisco = COOLDOWN_RECUSA_SEGUNDOS;
+        }
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.brincar) && s->cooldowns.brincar <= 0.0f)
+    {
+        if (brincar(&s->pet))
+            PlaySound(recursos->somBrincar);
+        else
+        {
+            snprintf(s->mensagemAcaoTexto, sizeof(s->mensagemAcaoTexto), "%s nao quis brincar agora!", s->pet.nome);
+            s->mensagemAcaoTimer = 2.0f;
+            s->cooldowns.brincar = COOLDOWN_RECUSA_SEGUNDOS;
+        }
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.dormir))
+        alternarDormir(&s->pet);
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.remedio) && s->cooldowns.remedio <= 0.0f && !darRemedio(&s->pet) && s->pet.doente)
+    {
+        snprintf(s->mensagemAcaoTexto, sizeof(s->mensagemAcaoTexto), "%s recusou o remedio!", s->pet.nome);
+        s->mensagemAcaoTimer = 2.0f;
+        s->cooldowns.remedio = COOLDOWN_RECUSA_SEGUNDOS;
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.elogiar))
+        elogiar(&s->pet);
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.repreender))
+        repreender(&s->pet);
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.luz))
+        s->luzAcesa = !s->luzAcesa;
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.salvar))
+    {
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+        s->saveExiste = true;
+        s->mensagemSalvoTimer = 2.0f;
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->jogo.menuTopo))
+    {
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+        s->saveExiste = true;
+        s->estado = ESTADO_MENU;
+    }
+
+    if (s->modoDev)
+    {
+        if (CheckCollisionPointRec(mouse, botoes->dev.velMenos))
+            s->velocidadeDevIndice = (s->velocidadeDevIndice + devCfg->numVelocidades - 1) % devCfg->numVelocidades;
+
+        if (CheckCollisionPointRec(mouse, botoes->dev.velMais))
+            s->velocidadeDevIndice = (s->velocidadeDevIndice + 1) % devCfg->numVelocidades;
+
+        if (CheckCollisionPointRec(mouse, botoes->dev.doente))
+            s->pet.doente = !s->pet.doente;
+
+        if (CheckCollisionPointRec(mouse, botoes->dev.avancarDia))
+        {
+            char mensagemDevDescartavel[100];
+            bool tornouAdultoDev = executarAvancoDeDia(&s->pet, s->historico, &s->numHistorico, mensagemDevDescartavel, sizeof(mensagemDevDescartavel));
+
+            if (tornouAdultoDev)
+            {
+                snprintf(s->popupAdultoTexto, sizeof(s->popupAdultoTexto), "Parabens! %s agora e um adulto!", s->pet.nome);
+                s->estado = ESTADO_ADULTO_POPUP;
+            }
+        }
+
+        if (CheckCollisionPointRec(mouse, botoes->dev.horaMenos))
+            s->pet.epochCriacao += 3600;
+
+        if (CheckCollisionPointRec(mouse, botoes->dev.horaMais))
+            s->pet.epochCriacao -= 3600;
+    }
+
+    // Limpar cocô clicando diretamente nele — só com a luz acesa (com a luz
+    // apagada o cocô fica só invisível, não sumiu de verdade, então não pode
+    // ser limpo sem querer no escuro)
+    if (s->luzAcesa)
+    {
+        for (int i = 0; i < s->pet.numCocos; i++)
+        {
+            float distX = mouse.x - s->pet.cocos[i].x;
+            float distY = mouse.y - s->pet.cocos[i].y;
+            float distancia = (distX * distX) + (distY * distY);
+
+            if (distancia <= (18 * 18))
+            {
+                limparCoco(&s->pet, i);
+                break;
+            }
+        }
+    }
+}
+
+void atualizarAdultoPopup(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+{
+    if (!clique) return;
+
+    if (CheckCollisionPointRec(mouse, botoes->popupAdulto.novoPet))
+    {
+        // O pet já foi arquivado em "pets descobertos" no momento em que virou
+        // adulto; aqui só salvamos e seguimos para criar o próximo pet.
+        salvarJogo(&s->pet, s->historico, s->numHistorico);
+
+        s->nomeDigitado[0] = '\0';
+        s->letraCount = 0;
+        s->horaEscolhida = obterHoraLocalAtual();
+        s->estado = ESTADO_NOMEAR;
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->popupAdulto.continuar))
+    {
+        s->estado = ESTADO_JOGO;
+    }
+}
+
+void atualizarMorte(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+{
+    if (!clique) return;
+
+    if (CheckCollisionPointRec(mouse, botoes->morte.novoJogo))
+    {
+        s->nomeDigitado[0] = '\0';
+        s->letraCount = 0;
+        s->horaEscolhida = obterHoraLocalAtual();
+        s->estado = ESTADO_NOMEAR;
+    }
+
+    if (CheckCollisionPointRec(mouse, botoes->morte.sair))
+    {
+        s->estado = ESTADO_MENU;
+    }
+}
+
+
+// ==================================================
+// TELAS — DESENHAR
+// ==================================================
+
+void desenharTelaMenu(Sessao *s, Botoes *botoes, int largura)
+{
+    const char *titulo = "MEU PET VIRTUAL";
+    int tamTitulo = 44;
+    int largTitulo = MeasureText(titulo, tamTitulo);
+
+    DrawText(titulo, largura / 2 - largTitulo / 2, 180, tamTitulo, DARKGRAY);
+
+    desenharBotao("NOVO JOGO", botoes->menu.novoJogo);
+
+    if (s->saveExiste)
+        desenharBotao("CARREGAR JOGO", botoes->menu.carregarJogo);
+    else
+        desenharBotaoDesabilitado("CARREGAR JOGO", botoes->menu.carregarJogo);
+
+    desenharBotao("PETS DESCOBERTOS", botoes->menu.verHistorico);
+
+    if (!s->saveExiste)
+    {
+        const char *aviso = "Nenhum save encontrado";
+        int largAviso = MeasureText(aviso, 18);
+        DrawText(aviso, largura / 2 - largAviso / 2, 550, 18, GRAY);
+    }
+}
+
+void desenharTelaHistorico(Sessao *s, Botoes *botoes, Recursos *recursos, int largura)
+{
+    desenharHistorico(s->historico, s->numHistorico, s->paginaHistorico, recursos->texturasEstagio, largura);
+
+    const int itensPorPagina = 6;
+    int totalPaginas = (s->numHistorico + itensPorPagina - 1) / itensPorPagina;
+    if (totalPaginas < 1) totalPaginas = 1;
+
+    if (s->paginaHistorico > 0)
+        desenharBotao("ANTERIOR", botoes->historico.anterior);
+    else
+        desenharBotaoDesabilitado("ANTERIOR", botoes->historico.anterior);
+
+    if (s->paginaHistorico < totalPaginas - 1)
+        desenharBotao("PROXIMA", botoes->historico.proxima);
+    else
+        desenharBotaoDesabilitado("PROXIMA", botoes->historico.proxima);
+
+    desenharBotao("VOLTAR", botoes->historico.voltar);
+}
+
+void desenharTelaNomear(Sessao *s, Botoes *botoes, int largura)
+{
+    const char *titulo = "COMO SE CHAMA SEU PET?";
+    int tamTitulo = 30;
+    int largTitulo = MeasureText(titulo, tamTitulo);
+
+    DrawText(titulo, largura / 2 - largTitulo / 2, 250, tamTitulo, DARKGRAY);
+
+    DrawRectangleRec(botoes->nomear.caixaNome, RAYWHITE);
+    DrawRectangleLinesEx(botoes->nomear.caixaNome, 2, DARKGRAY);
+
+    bool cursorAceso = (((int)(GetTime() * 2.0f)) % 2) == 0;
+
+    const char *textoExibido = TextFormat(
+        "%s%s",
+        s->nomeDigitado,
+        cursorAceso ? "_" : ""
+    );
+
+    DrawText(textoExibido, botoes->nomear.caixaNome.x + 10, botoes->nomear.caixaNome.y + 13, 24, DARKGRAY);
+
+    const char *perguntaHora = "Que horas sao agora?";
+    int largPerguntaHora = MeasureText(perguntaHora, 18);
+    DrawText(perguntaHora, largura / 2 - largPerguntaHora / 2, 350, 18, DARKGRAY);
+
+    desenharBotao("-", botoes->nomear.horaMenos);
+    desenharBotao("+", botoes->nomear.horaMais);
+
+    const char *textoHora = TextFormat("%02dh", s->horaEscolhida);
+    int largTextoHora = MeasureText(textoHora, 26);
+    DrawText(textoHora, largura / 2 - largTextoHora / 2, 383, 26, DARKGRAY);
+
+    bool podeComecar = (s->letraCount > 0);
+
+    if (podeComecar)
+        desenharBotao("COMECAR", botoes->nomear.comecar);
+    else
+        desenharBotaoDesabilitado("COMECAR", botoes->nomear.comecar);
+
+    desenharBotao("VOLTAR", botoes->nomear.voltar);
+}
+
+// Desenha a tela de jogo e, se for o caso, o popup modal de "virou adulto"
+// por cima dela (o popup pausa a tela de jogo por baixo, então os dois
+// dividem esta mesma função de desenho).
+void desenharTelaJogo(
+    Sessao *s,
+    Botoes *botoes,
+    Recursos *recursos,
+    PainelDevConfig *devCfg,
+    int largura,
+    int altura,
+    int centroPetX,
+    int centroPetY
+)
+{
+    DrawText("Meu Pet Virtual", 50, 40, 40, DARKGRAY);
+    DrawText(TextFormat("Nome: %s", s->pet.nome), 50, 85, 20, DARKGRAY);
+
+    // Com a luz apagada não dá para ver o painel de status nem o cocô no chão
+    if (s->luzAcesa)
+    {
+        desenharStatus(&s->pet);
+        desenharCocos(&s->pet);
+    }
+
+    desenharPet(
+        &s->pet, recursos->texturasEstagio,
+        recursos->bebeIdle1, recursos->bebeIdle2,
+        recursos->juvenil1Idle1, recursos->juvenil1Idle2,
+        recursos->juvenil2Idle1, recursos->juvenil2Idle2,
+        s->framePet, centroPetX, centroPetY
+    );
+
+    desenharDoenca(&s->pet, centroPetX + 90, centroPetY - 120);
+    desenharAtencao(&s->pet, centroPetX - 90, centroPetY - 120);
+
+    desenharBotoesDeAcao(&s->pet, s->cooldowns, s->luzAcesa, botoes->jogo);
+
+    // Posições logo abaixo da coluna de botões de ação (860, 120+55*9+10/+35)
+    if (s->mensagemSalvoTimer > 0.0f)
+        DrawText("Jogo salvo!", 860, 625, 20, DARKGREEN);
+
+    if (s->mensagemAcaoTimer > 0.0f)
+        DrawText(s->mensagemAcaoTexto, 860, 650, 18, MAROON);
+
+    if (s->bannerEvolucaoTimer > 0.0f)
+    {
+        int largBanner = MeasureText(s->bannerEvolucaoTexto, 26);
+
+        DrawRectangle(largura / 2 - largBanner / 2 - 20, 90, largBanner + 40, 45, Fade(GOLD, 0.9f));
+        DrawRectangleLines(largura / 2 - largBanner / 2 - 20, 90, largBanner + 40, 45, DARKBROWN);
+        DrawText(s->bannerEvolucaoTexto, largura / 2 - largBanner / 2, 100, 26, DARKBROWN);
+    }
+
+    // Escurece a tela quando a luz está apagada
+    if (!s->luzAcesa)
+    {
+        float alpha = s->pet.dormindo ? 0.75f : 0.55f;
+        DrawRectangle(0, 0, largura, altura, Fade(BLACK, alpha));
+
+        // Redesenha os botões por cima do escurecimento para continuarem visíveis/clicáveis
+        desenharBotoesDeAcao(&s->pet, s->cooldowns, s->luzAcesa, botoes->jogo);
+    }
+
+    // Popup modal de evolução para adulto (bloqueia a tela de jogo por baixo)
+    if (s->estado == ESTADO_ADULTO_POPUP)
+    {
+        DrawRectangle(0, 0, largura, altura, Fade(BLACK, 0.6f));
+
+        int tamMsg = 22;
+        int largMsg = MeasureText(s->popupAdultoTexto, tamMsg);
+
+        int largCaixa = largMsg + 80;
+        if (largCaixa < 600) largCaixa = 600;
+
+        int xCaixa = largura / 2 - largCaixa / 2;
+        int yCaixa = 240;
+        int altCaixa = 210;
+
+        DrawRectangle(xCaixa, yCaixa, largCaixa, altCaixa, Fade(GOLD, 0.95f));
+        DrawRectangleLines(xCaixa, yCaixa, largCaixa, altCaixa, DARKBROWN);
+
+        DrawText(s->popupAdultoTexto, largura / 2 - largMsg / 2, yCaixa + 30, tamMsg, DARKBROWN);
+
+        desenharBotao("1 - CRIAR NOVO PET", botoes->popupAdulto.novoPet);
+        desenharBotao("2 - CONTINUAR", botoes->popupAdulto.continuar);
+    }
+
+    // ---------- PAINEL DO MODO DEV ----------
+
+    if (s->modoDev)
+    {
+        DrawRectangleRec(botoes->dev.painel, BLACK);
+        DrawRectangleLinesEx(botoes->dev.painel, 2, RED);
+
+        DrawText("MODO DEV (F1 para sair)", botoes->dev.painel.x + 15, botoes->dev.painel.y + 10, 22, RED);
+
+        DrawText(
+            TextFormat("Velocidade: %.0fx", devCfg->velocidades[s->velocidadeDevIndice]),
+            botoes->dev.painel.x + 15, botoes->dev.painel.y + 48, 18, WHITE
+        );
+        desenharBotao("-", botoes->dev.velMenos);
+        desenharBotao("+", botoes->dev.velMais);
+
+        for (int i = 0; i < 7; i++)
+        {
+            controleDevStat(
+                devCfg->nomes[i], devCfg->ponteiros[i],
+                devCfg->minimo[i], devCfg->maximo[i], devCfg->passo[i],
+                botoes->dev.statMenos[i], botoes->dev.statMais[i],
+                botoes->dev.painel.x + 15, botoes->dev.painel.y + 98 + i * 42
+            );
+        }
+
+        desenharBotao(s->pet.doente ? "CURAR" : "ADOECER", botoes->dev.doente);
+        desenharBotao("AVANCAR 1 DIA", botoes->dev.avancarDia);
+        desenharBotao("HORA -1h", botoes->dev.horaMenos);
+        desenharBotao("HORA +1h", botoes->dev.horaMais);
+
+        float horaDev = horaAtualDoPet(&s->pet);
+
+        DrawText(
+            TextFormat(
+                "Hora do pet: %02d:%02dh (%s)%s",
+                (int)horaDev,
+                (int)((horaDev - (int)horaDev) * 60.0f),
+                ehPeriodoNoturno(horaDev) ? "NOITE" : "DIA",
+                s->pet.sonoProfundo ? " - sono profundo" : ""
+            ),
+            botoes->dev.painel.x + 15, botoes->dev.painel.y + 530, 18, YELLOW
+        );
+    }
+}
+
+void desenharTelaMorte(Sessao *s, Botoes *botoes, int largura)
+{
+    const char *titulo = TextFormat("%s nao resistiu...", s->pet.nome);
+    int tamTitulo = 34;
+    int largTitulo = MeasureText(titulo, tamTitulo);
+
+    DrawText(titulo, largura / 2 - largTitulo / 2, 220, tamTitulo, MAROON);
+
+    const char *subtitulo = TextFormat(
+        "Viveu %d dia(s), nivel %d, estagio %s",
+        s->pet.idade,
+        s->pet.nivel,
+        nomeDoEstagio(s->pet.estagio)
+    );
+
+    int largSub = MeasureText(subtitulo, 20);
+    DrawText(subtitulo, largura / 2 - largSub / 2, 270, 20, DARKGRAY);
+
+    const char *dica = "Negligencia (fome, sujeira ou doenca) pode ser fatal.";
+    int largDica = MeasureText(dica, 18);
+    DrawText(dica, largura / 2 - largDica / 2, 320, 18, GRAY);
+
+    desenharBotao("NOVO JOGO", botoes->morte.novoJogo);
+    desenharBotao("MENU", botoes->morte.sair);
+}
+
+
 // ==================================================
 // MAIN
 // ==================================================
@@ -1558,46 +2485,13 @@ int main(void)
     // ESTADO GERAL DO JOGO
     // ==================================================
 
-    Pet pet;
-    memset(&pet, 0, sizeof(Pet));
+    Sessao sessao = {0};
 
-    EstadoJogo estado = ESTADO_MENU;
-
-    bool saveExiste = false; // recalculado após InitWindow, pois depende de GetApplicationDirectory
-
-    HistoricoPet historico[MAX_HISTORICO];
-    int numHistorico = 0;
-    int paginaHistorico = 0;
-
-
-    // ==================================================
-    // MODO DEV (F1) — acelerar o tempo e manipular status pra testar
-    // ==================================================
-
-    bool modoDev = false;
-    int velocidadeDevIndice = 0;
-    float velocidadesDev[] = { 1.0f, 10.0f, 60.0f, 300.0f, 1800.0f };
-    int numVelocidadesDev = 5;
-
-    int *statPonteiros[7] = {
-        &pet.fome, &pet.felicidade, &pet.energia,
-        &pet.saude, &pet.disciplina, &pet.peso, &pet.nivel
-    };
-    const char *statNomesDev[7] = {
-        "Fome", "Felicidade", "Energia", "Saude", "Disciplina", "Peso", "Nivel"
-    };
-    int statMinDev[7] = { 0, 0, 0, 0, 0, 10, 1 };
-    int statMaxDev[7] = { 100, 100, 100, 100, 100, 200, 999 };
-    int statPassoDev[7] = { 10, 10, 10, 10, 10, 10, 1 };
-
-
-    // ==================================================
-    // NOMEAÇÃO DO PET
-    // ==================================================
-
-    char nomeDigitado[NOME_MAX] = "";
-    int letraCount = 0;
-    int horaEscolhida = obterHoraLocalAtual(); // "que horas são?" na criação do pet
+    sessao.estado = ESTADO_MENU;
+    sessao.luzAcesa = true;
+    sessao.horaEscolhida = obterHoraLocalAtual(); // "que horas são?" na criação do pet
+    sessao.relogios.proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
+    sessao.relogios.proximaAtencao = (float)GetRandomValue(20, 35);
 
 
     // ==================================================
@@ -1609,197 +2503,139 @@ int main(void)
 
     SetTargetFPS(60);
 
-    saveExiste = arquivoDeSaveExiste();
+    sessao.saveExiste = arquivoDeSaveExiste();
 
     // Carrega o histórico (e o pet salvo) desde já, para que "PETS DESCOBERTOS"
     // funcione no menu mesmo antes de o jogador clicar em "CARREGAR JOGO".
-    if (saveExiste)
-        carregarJogo(&pet, historico, &numHistorico);
+    if (sessao.saveExiste)
+        carregarJogo(&sessao.pet, sessao.historico, &sessao.numHistorico);
 
 
     // ==================================================
-    // CARREGAR SPRITES
+    // CARREGAR RECURSOS (SPRITES / ÁUDIO)
     // ==================================================
 
-    Texture2D texturasEstagio[ESTAGIO_TOTAL] = {0};
+    Recursos recursos = {0};
 
-    texturasEstagio[ESTAGIO_ADULTO1A] = carregarTexturaDoAsset("adulto1a.png");
-    texturasEstagio[ESTAGIO_ADULTO2A] = carregarTexturaDoAsset("adulto2a.png");
-    texturasEstagio[ESTAGIO_ADULTO3A] = carregarTexturaDoAsset("adulto3a.png");
-    texturasEstagio[ESTAGIO_ADULTO1B] = carregarTexturaDoAsset("adulto1b.png");
-    texturasEstagio[ESTAGIO_ADULTO2B] = carregarTexturaDoAsset("adulto2b.png");
-    texturasEstagio[ESTAGIO_ADULTO3B] = carregarTexturaDoAsset("adulto3b.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO1A] = carregarTexturaDoAsset("adulto1a.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO2A] = carregarTexturaDoAsset("adulto2a.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO3A] = carregarTexturaDoAsset("adulto3a.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO1B] = carregarTexturaDoAsset("adulto1b.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO2B] = carregarTexturaDoAsset("adulto2b.png");
+    recursos.texturasEstagio[ESTAGIO_ADULTO3B] = carregarTexturaDoAsset("adulto3b.png");
 
     // Bebe, Juvenil1 e Juvenil2 tem sprites de animacao (idle1 / idle2)
-    Texture2D bebeIdle1 = carregarTexturaDoAsset("bebe_idle1.png");
-    Texture2D bebeIdle2 = carregarTexturaDoAsset("bebe_idle2.png");
-    Texture2D juvenil1Idle1 = carregarTexturaDoAsset("juvenil1_idle1.png");
-    Texture2D juvenil1Idle2 = carregarTexturaDoAsset("juvenil1_idle2.png");
-    Texture2D juvenil2Idle1 = carregarTexturaDoAsset("juvenil2_idle1.png");
-    Texture2D juvenil2Idle2 = carregarTexturaDoAsset("juvenil2_idle2.png");
-
-
-    // ==================================================
-    // CARREGAR ÁUDIO
-    // ==================================================
+    recursos.bebeIdle1 = carregarTexturaDoAsset("bebe_idle1.png");
+    recursos.bebeIdle2 = carregarTexturaDoAsset("bebe_idle2.png");
+    recursos.juvenil1Idle1 = carregarTexturaDoAsset("juvenil1_idle1.png");
+    recursos.juvenil1Idle2 = carregarTexturaDoAsset("juvenil1_idle2.png");
+    recursos.juvenil2Idle1 = carregarTexturaDoAsset("juvenil2_idle1.png");
+    recursos.juvenil2Idle2 = carregarTexturaDoAsset("juvenil2_idle2.png");
 
     // sonsChoro[indiceSomChoro(estagio)] — adulto1a/1b compartilham som, idem 2a/2b e 3a/3b
-    Sound sonsChoro[6];
-    sonsChoro[0] = carregarSomDoAsset("baby_cry.ogg");
-    sonsChoro[1] = carregarSomDoAsset("juvenil1_cry.ogg");
-    sonsChoro[2] = carregarSomDoAsset("juvenil2_cry.ogg");
-    sonsChoro[3] = carregarSomDoAsset("adulto1ab_cry.wav");
-    sonsChoro[4] = carregarSomDoAsset("adulto2ab_cry.wav");
-    sonsChoro[5] = carregarSomDoAsset("adulto3ab_cry.wav");
+    recursos.sonsChoro[0] = carregarSomDoAsset("baby_cry.ogg");
+    recursos.sonsChoro[1] = carregarSomDoAsset("juvenil1_cry.ogg");
+    recursos.sonsChoro[2] = carregarSomDoAsset("juvenil2_cry.ogg");
+    recursos.sonsChoro[3] = carregarSomDoAsset("adulto1ab_cry.wav");
+    recursos.sonsChoro[4] = carregarSomDoAsset("adulto2ab_cry.wav");
+    recursos.sonsChoro[5] = carregarSomDoAsset("adulto3ab_cry.wav");
 
-    Sound somComer = carregarSomDoAsset("eating.mp3");
-    Sound somBrincar = carregarSomDoAsset("playing.mp3");
+    recursos.somComer = carregarSomDoAsset("eating.mp3");
+    recursos.somBrincar = carregarSomDoAsset("playing.mp3");
 
-    Music musicaFundo = carregarMusicaDoAsset("background_music.mp3");
-    SetMusicVolume(musicaFundo, 0.15f); // bem baixinho, é só ambiente
-    PlayMusicStream(musicaFundo);
+    recursos.musicaFundo = carregarMusicaDoAsset("background_music.mp3");
+    SetMusicVolume(recursos.musicaFundo, 0.15f); // bem baixinho, é só ambiente
+    PlayMusicStream(recursos.musicaFundo);
 
 
     // ==================================================
-    // ANIMAÇÃO
+    // POSIÇÃO DO PET NA TELA
     // ==================================================
-
-    float tempoAnimacao = 0.0f;
-    int framePet = 0;
 
     int centroPetX = 500;
     int centroPetY = 420;
 
 
     // ==================================================
-    // RELÓGIOS DE SIMULAÇÃO
+    // MODO DEV (F1) — acelerar o tempo e manipular status pra testar
     // ==================================================
 
-    float relogioTick = 0.0f;
-    float relogioIdade = 0.0f;
-
-    float relogioCoco = 0.0f;
-    float proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
-
-    float relogioAtencao = 0.0f;
-    float proximaAtencao = (float)GetRandomValue(20, 35);
-
-    float relogioChoro = 0.0f; // repete o choro a cada 3s reais enquanto pede atenção
-
-    float relogioAutosave = 0.0f;
-
-    float acumuladorLuz = 0.0f;
-
-    bool luzAcesa = true;
-
-    float mensagemSalvoTimer = 0.0f;
-
-    float mensagemAcaoTimer = 0.0f;
-    char mensagemAcaoTexto[100] = "";
-
-    // Tempo restante de bloqueio de cada botão depois de uma recusa
-    float cooldownRefeicao = 0.0f;
-    float cooldownPetisco = 0.0f;
-    float cooldownBrincar = 0.0f;
-    float cooldownRemedio = 0.0f;
-
-    float bannerEvolucaoTimer = 0.0f;
-    char bannerEvolucaoTexto[100] = "";
-
-    char popupAdultoTexto[100] = "";
+    PainelDevConfig devCfg = {
+        .ponteiros = {
+            &sessao.pet.fome, &sessao.pet.felicidade, &sessao.pet.energia,
+            &sessao.pet.saude, &sessao.pet.disciplina, &sessao.pet.peso, &sessao.pet.nivel
+        },
+        .nomes = { "Fome", "Felicidade", "Energia", "Saude", "Disciplina", "Peso", "Nivel" },
+        .minimo = { 0, 0, 0, 0, 0, 10, 1 },
+        .maximo = { 100, 100, 100, 100, 100, 200, 999 },
+        .passo = { 10, 10, 10, 10, 10, 10, 1 },
+        .velocidades = { 1.0f, 10.0f, 60.0f, 300.0f, 1800.0f },
+        .numVelocidades = 5
+    };
 
 
     // ==================================================
-    // BOTÕES - TELA DE MENU
+    // BOTÕES DE TODAS AS TELAS
     // ==================================================
 
-    Rectangle botaoNovoJogo      = { largura / 2 - 140, 330, 280, 55 };
-    Rectangle botaoCarregarJogo  = { largura / 2 - 140, 400, 280, 55 };
-    Rectangle botaoHistoricoMenu = { largura / 2 - 140, 470, 280, 55 };
+    Botoes botoes = {
+        .menu = {
+            .novoJogo     = { largura / 2 - 140, 330, 280, 55 },
+            .carregarJogo = { largura / 2 - 140, 400, 280, 55 },
+            .verHistorico = { largura / 2 - 140, 470, 280, 55 },
+        },
+        .popupAdulto = {
+            .novoPet   = { largura / 2 - 290, 360, 270, 55 },
+            .continuar = { largura / 2 + 20,  360, 270, 55 },
+        },
+        .historico = {
+            .anterior = { largura / 2 - 300, 680, 140, 45 },
+            .proxima  = { largura / 2 + 160, 680, 140, 45 },
+            .voltar   = { largura / 2 - 70,  680, 140, 45 },
+        },
+        .nomear = {
+            .caixaNome = { largura / 2 - 200, 300, 400, 50 },
+            .horaMenos = { largura / 2 - 90,  375, 45,  40 },
+            .horaMais  = { largura / 2 + 45,  375, 45,  40 },
+            .comecar   = { largura / 2 - 140, 440, 280, 55 },
+            .voltar    = { largura / 2 - 140, 510, 280, 55 },
+        },
+        .jogo = {
+            .refeicao   = { 860, 120 + 55 * 0, 200, 45 },
+            .petisco    = { 860, 120 + 55 * 1, 200, 45 },
+            .brincar    = { 860, 120 + 55 * 2, 200, 45 },
+            .dormir     = { 860, 120 + 55 * 3, 200, 45 },
+            .remedio    = { 860, 120 + 55 * 4, 200, 45 },
+            .elogiar    = { 860, 120 + 55 * 5, 200, 45 },
+            .repreender = { 860, 120 + 55 * 6, 200, 45 },
+            .luz        = { 860, 120 + 55 * 7, 200, 45 },
+            .salvar     = { 860, 120 + 55 * 8, 200, 45 },
+            .menuTopo   = { largura - 150, 30, 110, 35 },
+        },
+        .dev = {
+            .painel = { 40, 95, 680, 615 },
+        },
+        .morte = {
+            .novoJogo = { largura / 2 - 140, 420, 280, 55 },
+            .sair     = { largura / 2 - 140, 490, 280, 55 },
+        },
+    };
 
-
-    // ==================================================
-    // BOTÕES - POPUP "VIROU ADULTO"
-    // ==================================================
-
-    Rectangle botaoPopupNovoPet   = { largura / 2 - 290, 360, 270, 55 };
-    Rectangle botaoPopupContinuar = { largura / 2 + 20,  360, 270, 55 };
-
-
-    // ==================================================
-    // BOTÕES - TELA DE HISTÓRICO
-    // ==================================================
-
-    Rectangle botaoHistoricoAnterior = { largura / 2 - 300, 680, 140, 45 };
-    Rectangle botaoHistoricoProxima  = { largura / 2 + 160, 680, 140, 45 };
-    Rectangle botaoHistoricoVoltar   = { largura / 2 - 70,  680, 140, 45 };
-
-
-    // ==================================================
-    // BOTÕES - TELA DE NOMEAR
-    // ==================================================
-
-    Rectangle caixaNome        = { largura / 2 - 200, 300, 400, 50 };
-    Rectangle botaoHoraMenos   = { largura / 2 - 90,  375, 45,  40 };
-    Rectangle botaoHoraMais    = { largura / 2 + 45,  375, 45,  40 };
-    Rectangle botaoComecar     = { largura / 2 - 140, 440, 280, 55 };
-    Rectangle botaoVoltarMenu  = { largura / 2 - 140, 510, 280, 55 };
-
-
-    // ==================================================
-    // BOTÕES - TELA DE JOGO
-    // ==================================================
-
-    int botaoX = 860;
-    int botaoLargura = 200;
-    int botaoAltura = 45;
-    int botaoEspacamento = 55;
-    int botaoTopo = 120;
-
-    Rectangle botaoRefeicao   = { botaoX, botaoTopo + botaoEspacamento * 0, botaoLargura, botaoAltura };
-    Rectangle botaoPetisco    = { botaoX, botaoTopo + botaoEspacamento * 1, botaoLargura, botaoAltura };
-    Rectangle botaoBrincar    = { botaoX, botaoTopo + botaoEspacamento * 2, botaoLargura, botaoAltura };
-    Rectangle botaoDormir     = { botaoX, botaoTopo + botaoEspacamento * 3, botaoLargura, botaoAltura };
-    Rectangle botaoRemedio    = { botaoX, botaoTopo + botaoEspacamento * 4, botaoLargura, botaoAltura };
-    Rectangle botaoElogiar    = { botaoX, botaoTopo + botaoEspacamento * 5, botaoLargura, botaoAltura };
-    Rectangle botaoRepreender = { botaoX, botaoTopo + botaoEspacamento * 6, botaoLargura, botaoAltura };
-    Rectangle botaoLuz        = { botaoX, botaoTopo + botaoEspacamento * 7, botaoLargura, botaoAltura };
-    Rectangle botaoSalvar     = { botaoX, botaoTopo + botaoEspacamento * 8, botaoLargura, botaoAltura };
-
-    Rectangle botaoMenuTopo = { largura - 150, 30, 110, 35 };
-
-
-    // ==================================================
-    // PAINEL - MODO DEV
-    // ==================================================
-
-    Rectangle painelDev = { 40, 95, 680, 615 };
-
-    Rectangle botaoDevVelMenos = { painelDev.x + 380, painelDev.y + 40, 40, 32 };
-    Rectangle botaoDevVelMais  = { painelDev.x + 430, painelDev.y + 40, 40, 32 };
-
-    Rectangle botaoDevStatMenos[7];
-    Rectangle botaoDevStatMais[7];
+    // Botões do painel dev dependem da posição do painel, calculados à parte
+    botoes.dev.velMenos = (Rectangle){ botoes.dev.painel.x + 380, botoes.dev.painel.y + 40, 40, 32 };
+    botoes.dev.velMais  = (Rectangle){ botoes.dev.painel.x + 430, botoes.dev.painel.y + 40, 40, 32 };
 
     for (int i = 0; i < 7; i++)
     {
-        int yLinha = painelDev.y + 90 + i * 42;
-        botaoDevStatMenos[i] = (Rectangle){ painelDev.x + 380, yLinha, 40, 32 };
-        botaoDevStatMais[i]  = (Rectangle){ painelDev.x + 430, yLinha, 40, 32 };
+        int yLinha = botoes.dev.painel.y + 90 + i * 42;
+        botoes.dev.statMenos[i] = (Rectangle){ botoes.dev.painel.x + 380, yLinha, 40, 32 };
+        botoes.dev.statMais[i]  = (Rectangle){ botoes.dev.painel.x + 430, yLinha, 40, 32 };
     }
 
-    Rectangle botaoDevDoente     = { painelDev.x + 15,  painelDev.y + 480, 150, 36 };
-    Rectangle botaoDevAvancarDia = { painelDev.x + 180, painelDev.y + 480, 170, 36 };
-    Rectangle botaoDevHoraMenos  = { painelDev.x + 365, painelDev.y + 480, 80,  36 };
-    Rectangle botaoDevHoraMais   = { painelDev.x + 455, painelDev.y + 480, 80,  36 };
-
-
-    // ==================================================
-    // BOTÕES - TELA DE MORTE
-    // ==================================================
-
-    Rectangle botaoNovoJogoMorte = { largura / 2 - 140, 420, 280, 55 };
-    Rectangle botaoSairMorte     = { largura / 2 - 140, 490, 280, 55 };
+    botoes.dev.doente     = (Rectangle){ botoes.dev.painel.x + 15,  botoes.dev.painel.y + 480, 150, 36 };
+    botoes.dev.avancarDia = (Rectangle){ botoes.dev.painel.x + 180, botoes.dev.painel.y + 480, 170, 36 };
+    botoes.dev.horaMenos  = (Rectangle){ botoes.dev.painel.x + 365, botoes.dev.painel.y + 480, 80,  36 };
+    botoes.dev.horaMais   = (Rectangle){ botoes.dev.painel.x + 455, botoes.dev.painel.y + 480, 80,  36 };
 
 
     // ==================================================
@@ -1810,763 +2646,39 @@ int main(void)
     {
         float dt = GetFrameTime();
 
-        UpdateMusicStream(musicaFundo); // precisa rodar sempre, em qualquer tela
+        UpdateMusicStream(recursos.musicaFundo); // precisa rodar sempre, em qualquer tela
 
         Vector2 mouse = GetMousePosition();
-        bool cliquePressionado = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
+        bool clique = IsMouseButtonPressed(MOUSE_BUTTON_LEFT);
 
-
-        // ==================================================
-        // ESTADO: MENU INICIAL
-        // ==================================================
-
-        if (estado == ESTADO_MENU)
+        switch (sessao.estado)
         {
-            if (cliquePressionado)
-            {
-                if (CheckCollisionPointRec(mouse, botaoNovoJogo))
-                {
-                    nomeDigitado[0] = '\0';
-                    letraCount = 0;
-                    horaEscolhida = obterHoraLocalAtual();
-                    estado = ESTADO_NOMEAR;
-                }
-
-                if (saveExiste && CheckCollisionPointRec(mouse, botaoCarregarJogo))
-                {
-                    if (carregarJogo(&pet, historico, &numHistorico))
-                    {
-                        // reinicia os relógios de simulação para a nova sessão
-                        relogioTick = 0.0f;
-                        relogioIdade = 0.0f;
-                        relogioCoco = 0.0f;
-                        proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
-                        relogioAtencao = 0.0f;
-                        proximaAtencao = calcularProximaAtencao(pet.disciplina);
-                        relogioAutosave = 0.0f;
-                        acumuladorLuz = 0.0f;
-                        luzAcesa = true;
-                        bannerEvolucaoTimer = 0.0f;
-                        cooldownRefeicao = cooldownPetisco = cooldownBrincar = cooldownRemedio = 0.0f;
-
-                        // Simula o tempo real que passou desde o último save (o
-                        // jogo "correndo" enquanto o app estava fechado).
-                        bool tornouAdultoOffline = false;
-
-                        if (pet.vivo)
-                        {
-                            double segundosOffline = (double)(time(NULL) - (time_t)pet.ultimoSalvamento);
-                            simularTempoOffline(&pet, historico, &numHistorico, segundosOffline, &tornouAdultoOffline);
-                        }
-
-                        if (!pet.vivo)
-                        {
-                            estado = ESTADO_MORTE;
-                        }
-                        else if (tornouAdultoOffline)
-                        {
-                            snprintf(popupAdultoTexto, sizeof(popupAdultoTexto), "Parabens! %s agora e um adulto!", pet.nome);
-                            estado = ESTADO_ADULTO_POPUP;
-                        }
-                        else
-                        {
-                            estado = ESTADO_JOGO;
-                        }
-
-                        salvarJogo(&pet, historico, numHistorico); // persiste o resultado do tempo offline
-                    }
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoHistoricoMenu))
-                {
-                    paginaHistorico = 0;
-                    estado = ESTADO_HISTORICO;
-                }
-            }
+            case ESTADO_MENU:         atualizarMenu(&sessao, &botoes, mouse, clique); break;
+            case ESTADO_HISTORICO:    atualizarHistorico(&sessao, &botoes, mouse, clique); break;
+            case ESTADO_NOMEAR:       atualizarNomear(&sessao, &botoes, mouse, clique); break;
+            case ESTADO_JOGO:         atualizarJogo(&sessao, &botoes, &recursos, &devCfg, mouse, clique, dt); break;
+            case ESTADO_ADULTO_POPUP: atualizarAdultoPopup(&sessao, &botoes, mouse, clique); break;
+            case ESTADO_MORTE:        atualizarMorte(&sessao, &botoes, mouse, clique); break;
         }
-
-
-        // ==================================================
-        // ESTADO: PETS DESCOBERTOS (HISTÓRICO)
-        // ==================================================
-
-        else if (estado == ESTADO_HISTORICO)
-        {
-            if (cliquePressionado)
-            {
-                const int itensPorPagina = 6;
-                int totalPaginas = (numHistorico + itensPorPagina - 1) / itensPorPagina;
-                if (totalPaginas < 1) totalPaginas = 1;
-
-                if (CheckCollisionPointRec(mouse, botaoHistoricoAnterior) && paginaHistorico > 0)
-                    paginaHistorico--;
-
-                if (CheckCollisionPointRec(mouse, botaoHistoricoProxima) && paginaHistorico < totalPaginas - 1)
-                    paginaHistorico++;
-
-                if (CheckCollisionPointRec(mouse, botaoHistoricoVoltar))
-                    estado = ESTADO_MENU;
-            }
-        }
-
-
-        // ==================================================
-        // ESTADO: NOMEAR PET
-        // ==================================================
-
-        else if (estado == ESTADO_NOMEAR)
-        {
-            int tecla = GetCharPressed();
-
-            while (tecla > 0)
-            {
-                if ((tecla >= 32) && (tecla <= 125) && (letraCount < NOME_MAX - 1))
-                {
-                    nomeDigitado[letraCount] = (char)tecla;
-                    letraCount++;
-                    nomeDigitado[letraCount] = '\0';
-                }
-
-                tecla = GetCharPressed();
-            }
-
-            if (IsKeyPressed(KEY_BACKSPACE) && letraCount > 0)
-            {
-                letraCount--;
-                nomeDigitado[letraCount] = '\0';
-            }
-
-            if (cliquePressionado)
-            {
-                if (CheckCollisionPointRec(mouse, botaoHoraMenos))
-                    horaEscolhida = (horaEscolhida + 23) % 24;
-
-                if (CheckCollisionPointRec(mouse, botaoHoraMais))
-                    horaEscolhida = (horaEscolhida + 1) % 24;
-            }
-
-            bool podeComecar = (letraCount > 0);
-
-            if ((cliquePressionado && podeComecar && CheckCollisionPointRec(mouse, botaoComecar)) ||
-                (podeComecar && IsKeyPressed(KEY_ENTER)))
-            {
-                iniciarNovoJogo(&pet, nomeDigitado, horaEscolhida);
-
-                relogioTick = 0.0f;
-                relogioIdade = 0.0f;
-                relogioCoco = 0.0f;
-                proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
-                relogioAtencao = 0.0f;
-                proximaAtencao = calcularProximaAtencao(pet.disciplina);
-                relogioAutosave = 0.0f;
-                acumuladorLuz = 0.0f;
-                luzAcesa = true;
-                bannerEvolucaoTimer = 0.0f;
-                cooldownRefeicao = cooldownPetisco = cooldownBrincar = cooldownRemedio = 0.0f;
-
-                salvarJogo(&pet, historico, numHistorico);
-                saveExiste = true;
-
-                estado = ESTADO_JOGO;
-            }
-
-            if (cliquePressionado && CheckCollisionPointRec(mouse, botaoVoltarMenu))
-            {
-                estado = ESTADO_MENU;
-            }
-        }
-
-
-        // ==================================================
-        // ESTADO: JOGO
-        // ==================================================
-
-        else if (estado == ESTADO_JOGO)
-        {
-            // ---------- MODO DEV ----------
-
-            if (IsKeyPressed(KEY_F1))
-                modoDev = !modoDev;
-
-            // dtSimulado é o "dt de jogo": igual ao dt real, exceto que o modo
-            // dev pode multiplicá-lo pra acelerar o tempo. epochCriacao é
-            // deslocado pelo tempo "extra" pra a hora-do-dia do pet acompanhar.
-            float dtSimulado = dt;
-
-            if (modoDev)
-            {
-                dtSimulado = dt * velocidadesDev[velocidadeDevIndice];
-                pet.epochCriacao -= (long long)(dtSimulado - dt);
-            }
-
-            // ---------- ANIMAÇÃO ----------
-
-            tempoAnimacao += dt;
-
-            if (tempoAnimacao >= 0.5f)
-            {
-                tempoAnimacao = 0.0f;
-                framePet = (framePet == 0) ? 1 : 0;
-            }
-
-            // ---------- NECESSIDADES + AMOSTRAGEM PARA EVOLUÇÃO ----------
-
-            relogioTick += dtSimulado;
-
-            if (relogioTick >= INTERVALO_TICK)
-            {
-                relogioTick = 0.0f;
-                executarTick(&pet, historico, &numHistorico);
-            }
-
-            // ---------- ENVELHECIMENTO / NÍVEL / EVOLUÇÃO ----------
-
-            relogioIdade += dtSimulado;
-
-            if (relogioIdade >= INTERVALO_DIA && pet.vivo)
-            {
-                relogioIdade = 0.0f;
-
-                char mensagemEvolucao[100];
-                bool tornouAdulto = executarAvancoDeDia(&pet, historico, &numHistorico, mensagemEvolucao, sizeof(mensagemEvolucao));
-
-                if (tornouAdulto)
-                {
-                    snprintf(popupAdultoTexto, sizeof(popupAdultoTexto), "Parabens! %s agora e um adulto!", pet.nome);
-                    estado = ESTADO_ADULTO_POPUP;
-                }
-                else if (mensagemEvolucao[0] != '\0')
-                {
-                    strncpy(bannerEvolucaoTexto, mensagemEvolucao, sizeof(bannerEvolucaoTexto) - 1);
-                    bannerEvolucaoTexto[sizeof(bannerEvolucaoTexto) - 1] = '\0';
-                    bannerEvolucaoTimer = 5.0f;
-                }
-            }
-
-            // ---------- LUZ ----------
-            // (a recuperação de energia e o acordar automático agora ficam
-            // dentro de executarTick, junto com o resto das necessidades —
-            // assim funcionam também durante o tempo offline)
-
-            if (pet.dormindo && luzAcesa)
-            {
-                acumuladorLuz += dtSimulado;
-
-                if (acumuladorLuz >= 1800.0f) // dormir de luz acesa incomoda, a cada 30 min
-                {
-                    acumuladorLuz = 0.0f;
-                    pet.felicidade -= 2;
-                    limitarStatus(&pet);
-                }
-            }
-
-            // ---------- COCÔ ----------
-
-            relogioCoco += dtSimulado;
-
-            if (relogioCoco >= proximoCoco)
-            {
-                relogioCoco = 0.0f;
-                proximoCoco = (float)GetRandomValue((int)COCO_INTERVALO_MIN, (int)COCO_INTERVALO_MAX);
-                adicionarCoco(&pet);
-            }
-
-            // ---------- CHAMADO DE ATENÇÃO ----------
-
-            relogioAtencao += dtSimulado;
-
-            if (relogioAtencao >= proximaAtencao && !pet.pedindoAtencao && !pet.dormindo)
-            {
-                relogioAtencao = 0.0f;
-                proximaAtencao = calcularProximaAtencao(pet.disciplina);
-
-                pet.pedindoAtencao = true;
-                pet.atencaoPorNecessidade = precisaCuidado(&pet); // fixado agora, não recalculado depois
-
-                relogioChoro = 0.0f;
-                PlaySound(sonsChoro[indiceSomChoro(pet.estagio)]);
-            }
-
-            // Enquanto estiver pedindo atenção, repete o choro a cada 3s
-            // reais (não usa dtSimulado — o modo dev não deve acelerar o som).
-            if (pet.pedindoAtencao)
-            {
-                relogioChoro += dt;
-
-                if (relogioChoro >= 3.0f)
-                {
-                    relogioChoro -= 3.0f;
-                    PlaySound(sonsChoro[indiceSomChoro(pet.estagio)]);
-                }
-            }
-            else
-            {
-                relogioChoro = 0.0f;
-            }
-
-            // ---------- AUTOSAVE ----------
-
-            relogioAutosave += dt;
-
-            if (relogioAutosave >= INTERVALO_AUTOSAVE)
-            {
-                relogioAutosave = 0.0f;
-                salvarJogo(&pet, historico, numHistorico);
-            }
-
-            if (mensagemSalvoTimer > 0.0f)
-                mensagemSalvoTimer -= dt;
-
-            if (mensagemAcaoTimer > 0.0f)
-                mensagemAcaoTimer -= dt;
-
-            if (cooldownRefeicao > 0.0f) cooldownRefeicao -= dtSimulado;
-            if (cooldownPetisco  > 0.0f) cooldownPetisco  -= dtSimulado;
-            if (cooldownBrincar  > 0.0f) cooldownBrincar  -= dtSimulado;
-            if (cooldownRemedio  > 0.0f) cooldownRemedio  -= dtSimulado;
-
-            if (bannerEvolucaoTimer > 0.0f)
-                bannerEvolucaoTimer -= dt;
-
-            // ---------- MORTE ----------
-            // (o arquivamento em "pets descobertos" já é feito dentro de executarTick)
-
-            if (!pet.vivo)
-            {
-                salvarJogo(&pet, historico, numHistorico);
-                estado = ESTADO_MORTE;
-            }
-
-            // ---------- CLIQUES ----------
-
-            if (cliquePressionado)
-            {
-                if (CheckCollisionPointRec(mouse, botaoRefeicao) && cooldownRefeicao <= 0.0f)
-                {
-                    if (darRefeicao(&pet))
-                        PlaySound(somComer);
-                    else
-                    {
-                        snprintf(mensagemAcaoTexto, sizeof(mensagemAcaoTexto), "%s recusou a refeicao!", pet.nome);
-                        mensagemAcaoTimer = 2.0f;
-                        cooldownRefeicao = COOLDOWN_RECUSA_SEGUNDOS;
-                    }
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoPetisco) && cooldownPetisco <= 0.0f)
-                {
-                    if (darPetisco(&pet))
-                        PlaySound(somComer);
-                    else
-                    {
-                        snprintf(mensagemAcaoTexto, sizeof(mensagemAcaoTexto), "%s recusou o petisco!", pet.nome);
-                        mensagemAcaoTimer = 2.0f;
-                        cooldownPetisco = COOLDOWN_RECUSA_SEGUNDOS;
-                    }
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoBrincar) && cooldownBrincar <= 0.0f)
-                {
-                    if (brincar(&pet))
-                        PlaySound(somBrincar);
-                    else
-                    {
-                        snprintf(mensagemAcaoTexto, sizeof(mensagemAcaoTexto), "%s nao quis brincar agora!", pet.nome);
-                        mensagemAcaoTimer = 2.0f;
-                        cooldownBrincar = COOLDOWN_RECUSA_SEGUNDOS;
-                    }
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoDormir))
-                    alternarDormir(&pet);
-
-                if (CheckCollisionPointRec(mouse, botaoRemedio) && cooldownRemedio <= 0.0f && !darRemedio(&pet) && pet.doente)
-                {
-                    snprintf(mensagemAcaoTexto, sizeof(mensagemAcaoTexto), "%s recusou o remedio!", pet.nome);
-                    mensagemAcaoTimer = 2.0f;
-                    cooldownRemedio = COOLDOWN_RECUSA_SEGUNDOS;
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoElogiar))
-                    elogiar(&pet);
-
-                if (CheckCollisionPointRec(mouse, botaoRepreender))
-                    repreender(&pet);
-
-                if (CheckCollisionPointRec(mouse, botaoLuz))
-                    luzAcesa = !luzAcesa;
-
-                if (CheckCollisionPointRec(mouse, botaoSalvar))
-                {
-                    salvarJogo(&pet, historico, numHistorico);
-                    saveExiste = true;
-                    mensagemSalvoTimer = 2.0f;
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoMenuTopo))
-                {
-                    salvarJogo(&pet, historico, numHistorico);
-                    saveExiste = true;
-                    estado = ESTADO_MENU;
-                }
-
-                if (modoDev)
-                {
-                    if (CheckCollisionPointRec(mouse, botaoDevVelMenos))
-                        velocidadeDevIndice = (velocidadeDevIndice + numVelocidadesDev - 1) % numVelocidadesDev;
-
-                    if (CheckCollisionPointRec(mouse, botaoDevVelMais))
-                        velocidadeDevIndice = (velocidadeDevIndice + 1) % numVelocidadesDev;
-
-                    if (CheckCollisionPointRec(mouse, botaoDevDoente))
-                        pet.doente = !pet.doente;
-
-                    if (CheckCollisionPointRec(mouse, botaoDevAvancarDia))
-                    {
-                        char mensagemDevDescartavel[100];
-                        bool tornouAdultoDev = executarAvancoDeDia(&pet, historico, &numHistorico, mensagemDevDescartavel, sizeof(mensagemDevDescartavel));
-
-                        if (tornouAdultoDev)
-                        {
-                            snprintf(popupAdultoTexto, sizeof(popupAdultoTexto), "Parabens! %s agora e um adulto!", pet.nome);
-                            estado = ESTADO_ADULTO_POPUP;
-                        }
-                    }
-
-                    if (CheckCollisionPointRec(mouse, botaoDevHoraMenos))
-                        pet.epochCriacao += 3600;
-
-                    if (CheckCollisionPointRec(mouse, botaoDevHoraMais))
-                        pet.epochCriacao -= 3600;
-                }
-
-                // Limpar cocô clicando diretamente nele — só com a luz acesa
-                // (com a luz apagada o cocô fica só invisível, não sumiu de
-                // verdade, então não pode ser limpo sem querer no escuro)
-                if (luzAcesa)
-                {
-                    for (int i = 0; i < pet.numCocos; i++)
-                    {
-                        float distX = mouse.x - pet.cocos[i].x;
-                        float distY = mouse.y - pet.cocos[i].y;
-                        float distancia = (distX * distX) + (distY * distY);
-
-                        if (distancia <= (18 * 18))
-                        {
-                            limparCoco(&pet, i);
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-
-
-        // ==================================================
-        // ESTADO: POPUP "VIROU ADULTO"
-        // ==================================================
-
-        else if (estado == ESTADO_ADULTO_POPUP)
-        {
-            if (cliquePressionado)
-            {
-                if (CheckCollisionPointRec(mouse, botaoPopupNovoPet))
-                {
-                    // O pet já foi arquivado em "pets descobertos" no momento em que virou
-                    // adulto; aqui só salvamos e seguimos para criar o próximo pet.
-                    salvarJogo(&pet, historico, numHistorico);
-
-                    nomeDigitado[0] = '\0';
-                    letraCount = 0;
-                    horaEscolhida = obterHoraLocalAtual();
-                    estado = ESTADO_NOMEAR;
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoPopupContinuar))
-                {
-                    estado = ESTADO_JOGO;
-                }
-            }
-        }
-
-
-        // ==================================================
-        // ESTADO: MORTE
-        // ==================================================
-
-        else if (estado == ESTADO_MORTE)
-        {
-            if (cliquePressionado)
-            {
-                if (CheckCollisionPointRec(mouse, botaoNovoJogoMorte))
-                {
-                    nomeDigitado[0] = '\0';
-                    letraCount = 0;
-                    horaEscolhida = obterHoraLocalAtual();
-                    estado = ESTADO_NOMEAR;
-                }
-
-                if (CheckCollisionPointRec(mouse, botaoSairMorte))
-                {
-                    estado = ESTADO_MENU;
-                }
-            }
-        }
-
-
-        // ==================================================
-        // DESENHO
-        // ==================================================
 
         BeginDrawing();
 
         ClearBackground(RAYWHITE);
 
-
-        if (estado == ESTADO_MENU)
+        switch (sessao.estado)
         {
-            const char *titulo = "MEU PET VIRTUAL";
-            int tamTitulo = 44;
-            int largTitulo = MeasureText(titulo, tamTitulo);
+            case ESTADO_MENU:      desenharTelaMenu(&sessao, &botoes, largura); break;
+            case ESTADO_HISTORICO: desenharTelaHistorico(&sessao, &botoes, &recursos, largura); break;
+            case ESTADO_NOMEAR:    desenharTelaNomear(&sessao, &botoes, largura); break;
 
-            DrawText(titulo, largura / 2 - largTitulo / 2, 180, tamTitulo, DARKGRAY);
+            // O popup de "virou adulto" é desenhado como parte da tela de
+            // jogo (pausada por baixo dele) — ver desenharTelaJogo.
+            case ESTADO_JOGO:
+            case ESTADO_ADULTO_POPUP:
+                desenharTelaJogo(&sessao, &botoes, &recursos, &devCfg, largura, altura, centroPetX, centroPetY);
+                break;
 
-            desenharBotao("NOVO JOGO", botaoNovoJogo);
-
-            if (saveExiste)
-                desenharBotao("CARREGAR JOGO", botaoCarregarJogo);
-            else
-                desenharBotaoDesabilitado("CARREGAR JOGO", botaoCarregarJogo);
-
-            desenharBotao("PETS DESCOBERTOS", botaoHistoricoMenu);
-
-            if (!saveExiste)
-            {
-                const char *aviso = "Nenhum save encontrado";
-                int largAviso = MeasureText(aviso, 18);
-                DrawText(aviso, largura / 2 - largAviso / 2, 550, 18, GRAY);
-            }
-        }
-
-        else if (estado == ESTADO_HISTORICO)
-        {
-            desenharHistorico(historico, numHistorico, paginaHistorico, texturasEstagio, largura);
-
-            const int itensPorPagina = 6;
-            int totalPaginas = (numHistorico + itensPorPagina - 1) / itensPorPagina;
-            if (totalPaginas < 1) totalPaginas = 1;
-
-            if (paginaHistorico > 0)
-                desenharBotao("ANTERIOR", botaoHistoricoAnterior);
-            else
-                desenharBotaoDesabilitado("ANTERIOR", botaoHistoricoAnterior);
-
-            if (paginaHistorico < totalPaginas - 1)
-                desenharBotao("PROXIMA", botaoHistoricoProxima);
-            else
-                desenharBotaoDesabilitado("PROXIMA", botaoHistoricoProxima);
-
-            desenharBotao("VOLTAR", botaoHistoricoVoltar);
-        }
-
-        else if (estado == ESTADO_NOMEAR)
-        {
-            const char *titulo = "COMO SE CHAMA SEU PET?";
-            int tamTitulo = 30;
-            int largTitulo = MeasureText(titulo, tamTitulo);
-
-            DrawText(titulo, largura / 2 - largTitulo / 2, 250, tamTitulo, DARKGRAY);
-
-            DrawRectangleRec(caixaNome, RAYWHITE);
-            DrawRectangleLinesEx(caixaNome, 2, DARKGRAY);
-
-            bool cursorAceso = (((int)(GetTime() * 2.0f)) % 2) == 0;
-
-            const char *textoExibido = TextFormat(
-                "%s%s",
-                nomeDigitado,
-                cursorAceso ? "_" : ""
-            );
-
-            DrawText(textoExibido, caixaNome.x + 10, caixaNome.y + 13, 24, DARKGRAY);
-
-            const char *perguntaHora = "Que horas sao agora?";
-            int largPerguntaHora = MeasureText(perguntaHora, 18);
-            DrawText(perguntaHora, largura / 2 - largPerguntaHora / 2, 350, 18, DARKGRAY);
-
-            desenharBotao("-", botaoHoraMenos);
-            desenharBotao("+", botaoHoraMais);
-
-            const char *textoHora = TextFormat("%02dh", horaEscolhida);
-            int largTextoHora = MeasureText(textoHora, 26);
-            DrawText(textoHora, largura / 2 - largTextoHora / 2, 383, 26, DARKGRAY);
-
-            bool podeComecar = (letraCount > 0);
-
-            if (podeComecar)
-                desenharBotao("COMECAR", botaoComecar);
-            else
-                desenharBotaoDesabilitado("COMECAR", botaoComecar);
-
-            desenharBotao("VOLTAR", botaoVoltarMenu);
-        }
-
-        else if (estado == ESTADO_JOGO || estado == ESTADO_ADULTO_POPUP)
-        {
-            DrawText("Meu Pet Virtual", 50, 40, 40, DARKGRAY);
-            DrawText(TextFormat("Nome: %s", pet.nome), 50, 85, 20, DARKGRAY);
-
-            // Com a luz apagada não dá para ver o painel de status nem o cocô no chão
-            if (luzAcesa)
-            {
-                desenharStatus(&pet);
-                desenharCocos(&pet);
-            }
-
-            desenharPet(&pet, texturasEstagio, bebeIdle1, bebeIdle2, juvenil1Idle1, juvenil1Idle2, juvenil2Idle1, juvenil2Idle2, framePet, centroPetX, centroPetY);
-
-            desenharDoenca(&pet, centroPetX + 90, centroPetY - 120);
-            desenharAtencao(&pet, centroPetX - 90, centroPetY - 120);
-
-            if (cooldownRefeicao > 0.0f) desenharBotaoBloqueado("REFEICAO", botaoRefeicao); else desenharBotao("REFEICAO", botaoRefeicao);
-            if (cooldownPetisco  > 0.0f) desenharBotaoBloqueado("PETISCO", botaoPetisco);   else desenharBotao("PETISCO", botaoPetisco);
-            if (cooldownBrincar  > 0.0f) desenharBotaoBloqueado("BRINCAR", botaoBrincar);   else desenharBotao("BRINCAR", botaoBrincar);
-            desenharBotao(pet.dormindo ? "ACORDAR" : "DORMIR", botaoDormir);
-            if (cooldownRemedio  > 0.0f) desenharBotaoBloqueado("REMEDIO", botaoRemedio);   else desenharBotao("REMEDIO", botaoRemedio);
-            desenharBotao("ELOGIAR", botaoElogiar);
-            desenharBotao("REPREENDER", botaoRepreender);
-            desenharBotao(luzAcesa ? "APAGAR LUZ" : "ACENDER LUZ", botaoLuz);
-            desenharBotao("SALVAR", botaoSalvar);
-            desenharBotao("MENU", botaoMenuTopo);
-
-            if (mensagemSalvoTimer > 0.0f)
-                DrawText("Jogo salvo!", botaoX, botaoTopo + botaoEspacamento * 9 + 10, 20, DARKGREEN);
-
-            if (mensagemAcaoTimer > 0.0f)
-                DrawText(mensagemAcaoTexto, botaoX, botaoTopo + botaoEspacamento * 9 + 35, 18, MAROON);
-
-            if (bannerEvolucaoTimer > 0.0f)
-            {
-                int largBanner = MeasureText(bannerEvolucaoTexto, 26);
-
-                DrawRectangle(largura / 2 - largBanner / 2 - 20, 90, largBanner + 40, 45, Fade(GOLD, 0.9f));
-                DrawRectangleLines(largura / 2 - largBanner / 2 - 20, 90, largBanner + 40, 45, DARKBROWN);
-                DrawText(bannerEvolucaoTexto, largura / 2 - largBanner / 2, 100, 26, DARKBROWN);
-            }
-
-            // Escurece a tela quando a luz está apagada
-            if (!luzAcesa)
-            {
-                float alpha = pet.dormindo ? 0.75f : 0.55f;
-                DrawRectangle(0, 0, largura, altura, Fade(BLACK, alpha));
-
-                // Redesenha os botões por cima do escurecimento para continuarem visíveis/clicáveis
-                if (cooldownRefeicao > 0.0f) desenharBotaoBloqueado("REFEICAO", botaoRefeicao); else desenharBotao("REFEICAO", botaoRefeicao);
-                if (cooldownPetisco  > 0.0f) desenharBotaoBloqueado("PETISCO", botaoPetisco);   else desenharBotao("PETISCO", botaoPetisco);
-                if (cooldownBrincar  > 0.0f) desenharBotaoBloqueado("BRINCAR", botaoBrincar);   else desenharBotao("BRINCAR", botaoBrincar);
-                desenharBotao(pet.dormindo ? "ACORDAR" : "DORMIR", botaoDormir);
-                if (cooldownRemedio  > 0.0f) desenharBotaoBloqueado("REMEDIO", botaoRemedio);   else desenharBotao("REMEDIO", botaoRemedio);
-                desenharBotao("ELOGIAR", botaoElogiar);
-                desenharBotao("REPREENDER", botaoRepreender);
-                desenharBotao(luzAcesa ? "APAGAR LUZ" : "ACENDER LUZ", botaoLuz);
-                desenharBotao("SALVAR", botaoSalvar);
-                desenharBotao("MENU", botaoMenuTopo);
-            }
-
-            // Popup modal de evolução para adulto (bloqueia a tela de jogo por baixo)
-            if (estado == ESTADO_ADULTO_POPUP)
-            {
-                DrawRectangle(0, 0, largura, altura, Fade(BLACK, 0.6f));
-
-                int tamMsg = 22;
-                int largMsg = MeasureText(popupAdultoTexto, tamMsg);
-
-                int largCaixa = largMsg + 80;
-                if (largCaixa < 600) largCaixa = 600;
-
-                int xCaixa = largura / 2 - largCaixa / 2;
-                int yCaixa = 240;
-                int altCaixa = 210;
-
-                DrawRectangle(xCaixa, yCaixa, largCaixa, altCaixa, Fade(GOLD, 0.95f));
-                DrawRectangleLines(xCaixa, yCaixa, largCaixa, altCaixa, DARKBROWN);
-
-                DrawText(popupAdultoTexto, largura / 2 - largMsg / 2, yCaixa + 30, tamMsg, DARKBROWN);
-
-                desenharBotao("1 - CRIAR NOVO PET", botaoPopupNovoPet);
-                desenharBotao("2 - CONTINUAR", botaoPopupContinuar);
-            }
-
-            // ---------- PAINEL DO MODO DEV ----------
-
-            if (modoDev)
-            {
-                DrawRectangleRec(painelDev, BLACK);
-                DrawRectangleLinesEx(painelDev, 2, RED);
-
-                DrawText("MODO DEV (F1 para sair)", painelDev.x + 15, painelDev.y + 10, 22, RED);
-
-                DrawText(
-                    TextFormat("Velocidade: %.0fx", velocidadesDev[velocidadeDevIndice]),
-                    painelDev.x + 15, painelDev.y + 48, 18, WHITE
-                );
-                desenharBotao("-", botaoDevVelMenos);
-                desenharBotao("+", botaoDevVelMais);
-
-                for (int i = 0; i < 7; i++)
-                {
-                    controleDevStat(
-                        statNomesDev[i], statPonteiros[i],
-                        statMinDev[i], statMaxDev[i], statPassoDev[i],
-                        botaoDevStatMenos[i], botaoDevStatMais[i],
-                        painelDev.x + 15, painelDev.y + 98 + i * 42
-                    );
-                }
-
-                desenharBotao(pet.doente ? "CURAR" : "ADOECER", botaoDevDoente);
-                desenharBotao("AVANCAR 1 DIA", botaoDevAvancarDia);
-                desenharBotao("HORA -1h", botaoDevHoraMenos);
-                desenharBotao("HORA +1h", botaoDevHoraMais);
-
-                float horaDev = horaAtualDoPet(&pet);
-
-                DrawText(
-                    TextFormat(
-                        "Hora do pet: %02d:%02dh (%s)%s",
-                        (int)horaDev,
-                        (int)((horaDev - (int)horaDev) * 60.0f),
-                        ehPeriodoNoturno(horaDev) ? "NOITE" : "DIA",
-                        pet.sonoProfundo ? " - sono profundo" : ""
-                    ),
-                    painelDev.x + 15, painelDev.y + 530, 18, YELLOW
-                );
-            }
-        }
-
-        else if (estado == ESTADO_MORTE)
-        {
-            const char *titulo = TextFormat("%s nao resistiu...", pet.nome);
-            int tamTitulo = 34;
-            int largTitulo = MeasureText(titulo, tamTitulo);
-
-            DrawText(titulo, largura / 2 - largTitulo / 2, 220, tamTitulo, MAROON);
-
-            const char *subtitulo = TextFormat(
-                "Viveu %d dia(s), nivel %d, estagio %s",
-                pet.idade,
-                pet.nivel,
-                nomeDoEstagio(pet.estagio)
-            );
-
-            int largSub = MeasureText(subtitulo, 20);
-            DrawText(subtitulo, largura / 2 - largSub / 2, 270, 20, DARKGRAY);
-
-            const char *dica = "Negligencia (fome, sujeira ou doenca) pode ser fatal.";
-            int largDica = MeasureText(dica, 18);
-            DrawText(dica, largura / 2 - largDica / 2, 320, 18, GRAY);
-
-            desenharBotao("NOVO JOGO", botaoNovoJogoMorte);
-            desenharBotao("MENU", botaoSairMorte);
+            case ESTADO_MORTE: desenharTelaMorte(&sessao, &botoes, largura); break;
         }
 
         EndDrawing();
@@ -2577,8 +2689,8 @@ int main(void)
     // SALVAR ANTES DE SAIR
     // ==================================================
 
-    if (estado == ESTADO_JOGO)
-        salvarJogo(&pet, historico, numHistorico);
+    if (sessao.estado == ESTADO_JOGO)
+        salvarJogo(&sessao.pet, sessao.historico, sessao.numHistorico);
 
 
     // ==================================================
@@ -2590,22 +2702,22 @@ int main(void)
         if (i == ESTAGIO_BEBE || i == ESTAGIO_JUVENIL1 || i == ESTAGIO_JUVENIL2)
             continue; // essas nao usam texturasEstagio, tem suas proprias texturas de animacao
 
-        UnloadTexture(texturasEstagio[i]);
+        UnloadTexture(recursos.texturasEstagio[i]);
     }
 
-    UnloadTexture(bebeIdle1);
-    UnloadTexture(bebeIdle2);
-    UnloadTexture(juvenil1Idle1);
-    UnloadTexture(juvenil1Idle2);
-    UnloadTexture(juvenil2Idle1);
-    UnloadTexture(juvenil2Idle2);
+    UnloadTexture(recursos.bebeIdle1);
+    UnloadTexture(recursos.bebeIdle2);
+    UnloadTexture(recursos.juvenil1Idle1);
+    UnloadTexture(recursos.juvenil1Idle2);
+    UnloadTexture(recursos.juvenil2Idle1);
+    UnloadTexture(recursos.juvenil2Idle2);
 
     for (int i = 0; i < 6; i++)
-        UnloadSound(sonsChoro[i]);
+        UnloadSound(recursos.sonsChoro[i]);
 
-    UnloadSound(somComer);
-    UnloadSound(somBrincar);
-    UnloadMusicStream(musicaFundo);
+    UnloadSound(recursos.somComer);
+    UnloadSound(recursos.somBrincar);
+    UnloadMusicStream(recursos.musicaFundo);
 
     CloseAudioDevice();
     CloseWindow();
