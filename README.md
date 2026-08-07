@@ -47,7 +47,7 @@ O pet pode ficar doente com mais chance quando a saúde, a fome ou a felicidade 
 
 ## Evolução
 
-<img width="3464" height="3464" alt="Picsart_26-08-07_12-22-23-123" src="https://github.com/user-attachments/assets/e900b190-7109-48c5-a53c-588e85bec224" />
+<img width="1097" height="1097" alt="Picsart_26-08-07_12-47-14-242" src="https://github.com/user-attachments/assets/b8814fdd-f1d1-444c-99c2-d5973b0119f5" />
 
 
 O pet evolui em três fases, avançando um nível a cada "dia" do jogo:
