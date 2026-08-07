@@ -2,6 +2,8 @@ Meu primeiro jogo: um simulador de bichinho virtual (tipo Tamagotchi), feito em 
 
 Cuide do seu pet, mantenha os status em dia e acompanhe ele evoluir de bebê a adulto — inclusive enquanto o jogo está fechado.
 
+![Tela de jogo, mostrando os status do pet e os botões de ação](docs/screenshots/gameplay.png)
+
 ## Como jogar
 
 1. Abra o jogo (`mypetgame/output/main.exe` no Windows, ou compile a partir do código-fonte — veja abaixo).
@@ -42,6 +44,8 @@ De tempos em tempos (mais seguido com disciplina baixa) o pet pede atenção. Se
 O pet pode ficar doente com mais chance quando a saúde, a fome ou a felicidade estão baixas, ou quando há sujeira acumulada. Doença não tratada continua corroendo a saúde. Se a saúde chegar a 0, o pet morre — e vai para a lista de **PETS DESCOBERTOS**, no menu principal.
 
 ## Evolução
+
+![Os três estágios evolutivos do pet: bebê, juvenil e adulto](docs/screenshots/evolucao.png)
 
 O pet evolui em três fases, avançando um nível a cada "dia" do jogo:
 
