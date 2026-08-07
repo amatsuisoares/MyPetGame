@@ -1,8 +1,10 @@
+
 Meu primeiro jogo: um simulador de bichinho virtual (tipo Tamagotchi), feito em C com [raylib](https://www.raylib.com/).
 
 Cuide do seu pet, mantenha os status em dia e acompanhe ele evoluir de bebê a adulto — inclusive enquanto o jogo está fechado.
 
-![Tela de jogo, mostrando os status do pet e os botões de ação](docs/screenshots/gameplay.png)
+<img width="1097" height="765" alt="Screenshot 2026-08-06 181328" src="https://github.com/user-attachments/assets/7aa0f192-91ba-4754-88e5-a83bd3abf2a9" />
+
 
 ## Como jogar
 
@@ -45,7 +47,8 @@ O pet pode ficar doente com mais chance quando a saúde, a fome ou a felicidade 
 
 ## Evolução
 
-![Os três estágios evolutivos do pet: bebê, juvenil e adulto](docs/screenshots/evolucao.png)
+<img width="3464" height="3464" alt="Picsart_26-08-07_12-22-23-123" src="https://github.com/user-attachments/assets/e900b190-7109-48c5-a53c-588e85bec224" />
+
 
 O pet evolui em três fases, avançando um nível a cada "dia" do jogo:
 
