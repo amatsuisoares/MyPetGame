@@ -20,11 +20,13 @@
 // desde o nascimento) — reflete como o pet andou sendo cuidado nas últimas
 // horas. MEIA_VIDA_MEDIA_EVOLUCAO_HORAS é o tempo pra o peso de uma amostra
 // antiga cair pela metade (ver executarTick).
-#define MEIA_VIDA_MEDIA_EVOLUCAO_HORAS 6.0f
+// Reduzida na mesma proporção que INTERVALO_DIA (1/3) para manter a mesma
+// razão entre "janela de média" e duração do estágio de antes.
+#define MEIA_VIDA_MEDIA_EVOLUCAO_HORAS 2.0f
 
-// Ritmo real de tamagotchi: bebe->juvenil em 24h reais (10 niveis) e
-// juvenil->adulto em +48h reais (+20 niveis) => 1 nivel = 24h/10 = 2.4h.
-#define INTERVALO_DIA      8640.0f // segundos que equivalem a 1 dia (= 1 nível) do pet
+// Ritmo real de tamagotchi: bebe->juvenil em 8h reais (10 niveis) e
+// juvenil->adulto em +16h reais (+20 niveis) => 1 nivel = 8h/10 = 0.8h.
+#define INTERVALO_DIA      2880.0f // segundos que equivalem a 1 dia (= 1 nível) do pet
 
 // Um "pulso" de necessidades a cada 20 minutos. Rápido o bastante para o
 // jogo reagir, devagar o bastante para não precisar ficar de olho o tempo
@@ -632,16 +634,16 @@ void aplicarNegligencia(Pet *pet)
     if (!pet->vivo) return;
 
     if (pet->fome <= 0)
-        pet->saude -= 3;
+        pet->saude -= 4; // era 3 — dreno mais rapido, coerente com o novo pace de evolucao
 
     if (pet->numCocos >= MAX_COCOS)
         pet->saude -= 1;
 
     if (pet->doente)
-        pet->saude -= (pet->peso > PESO_LIMITE_SOBREPESO) ? 4 : 2; // acima do peso adoece pior
+        pet->saude -= (pet->peso > PESO_LIMITE_SOBREPESO) ? 6 : 3; // era 4 / 2 — acima do peso adoece pior
 
     if (pet->felicidade <= 0)
-        pet->saude -= 1;
+        pet->saude -= 2; // era 1
 
     limitarStatus(pet);
 
@@ -725,18 +727,18 @@ bool executarTick(Pet *pet, HistoricoPet *historico, int *numHistorico)
         // energia também, só que menos, e a fome cai igual a se tivesse
         // acordado — a desaceleração de fome é exclusiva do sono profundo.
         pet->energia += pet->sonoProfundo ? 7 : 5;
-        pet->fome -= pet->sonoProfundo ? 0 : 2;
+        pet->fome -= pet->sonoProfundo ? 0 : 3; // dreno ~1.5x (era 2) — pace mais rapido de evolucao
     }
     else
     {
         // Ficar acordado de madrugada cansa mais rápido.
-        pet->energia -= ehPeriodoNoturno(hora) ? 2 : 1;
-        pet->felicidade -= 1;
-        pet->fome -= 2;
+        pet->energia -= ehPeriodoNoturno(hora) ? 3 : 2; // era 2 / 1
+        pet->felicidade -= 2; // era 1
+        pet->fome -= 3; // era 2
     }
 
     if (pet->pedindoAtencao)
-        pet->felicidade -= 1;
+        pet->felicidade -= 2; // era 1
 
     // Repreensões seguidas vão sendo perdoadas com o tempo se o pet não
     // levar mais nenhuma (ver repreender).
@@ -1770,7 +1772,7 @@ void desenharBotoesDeAcao(Pet *pet, Cooldowns cooldowns, bool luzAcesa, BotoesJo
 // TELAS — ATUALIZAR (INPUT + LÓGICA)
 // ==================================================
 
-void atualizarMenu(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
+void atualizarMenu(Sessao *s, Botoes *botoes, Recursos *recursos, Vector2 mouse, bool clique)
 {
     if (!clique) return;
 
@@ -1810,6 +1812,17 @@ void atualizarMenu(Sessao *s, Botoes *botoes, Vector2 mouse, bool clique)
             else
             {
                 s->estado = ESTADO_JOGO;
+            }
+
+            // O pet sente falta do jogador enquanto o app ficou fechado: ao
+            // voltar (se estiver vivo e acordado), ele já reaparece pedindo
+            // atenção, em vez de esperar o próximo pulso aleatório.
+            if (s->pet.vivo && !s->pet.dormindo)
+            {
+                s->pet.pedindoAtencao = true;
+                s->pet.atencaoPorNecessidade = precisaCuidado(&s->pet);
+                s->relogios.choro = 0.0f;
+                PlaySound(recursos->sonsChoro[indiceSomChoro(s->pet.estagio)]);
             }
 
             salvarJogo(&s->pet, s->historico, s->numHistorico); // persiste o resultado do tempo offline
@@ -2653,7 +2666,7 @@ int main(void)
 
         switch (sessao.estado)
         {
-            case ESTADO_MENU:         atualizarMenu(&sessao, &botoes, mouse, clique); break;
+            case ESTADO_MENU:         atualizarMenu(&sessao, &botoes, &recursos, mouse, clique); break;
             case ESTADO_HISTORICO:    atualizarHistorico(&sessao, &botoes, mouse, clique); break;
             case ESTADO_NOMEAR:       atualizarNomear(&sessao, &botoes, mouse, clique); break;
             case ESTADO_JOGO:         atualizarJogo(&sessao, &botoes, &recursos, &devCfg, mouse, clique, dt); break;
